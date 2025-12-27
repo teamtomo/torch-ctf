@@ -1,9 +1,16 @@
 """CTF calculation with Ewald sphere correction."""
 
+import einops
 import torch
+from torch_grid_utils.fftfreq_grid import fftfreq_grid
 
 from torch_ctf.ctf_2d import _setup_ctf_2d
-from torch_ctf.ctf_aberrations import apply_even_zernikes, apply_odd_zernikes
+from torch_ctf.ctf_aberrations import (
+    apply_even_zernikes,
+    apply_odd_zernikes,
+    calculate_defocus_phase_aberration,
+    calculate_relativistic_electron_wavelength,
+)
 from torch_ctf.ctf_utils import calculate_total_phase_shift
 
 
@@ -17,8 +24,9 @@ def calculate_ctfp_and_ctfq_2d(
     phase_shift: float | torch.Tensor,
     pixel_size: float | torch.Tensor,
     image_shape: tuple[int, int],
-    rfft: bool,
-    fftshift: bool,
+    rfft: bool = True,
+    fftshift: bool = False,
+    discontinuity_angle: float = 0.0,
     beam_tilt_mrad: torch.Tensor | None = None,
     even_zernike_coeffs: dict | None = None,
     odd_zernike_coeffs: dict | None = None,
@@ -49,8 +57,19 @@ def calculate_ctfp_and_ctfq_2d(
         Shape of 2D images onto which CTF will be applied.
     rfft : bool
         Generate the CTF containing only the non-redundant half transform from a rfft.
+        Default is True (required for Ewald sphere correction).
     fftshift : bool
         Whether to apply fftshift on the resulting CTF images.
+    discontinuity_angle : float
+        Discontinuity angle in degrees (default: 0.0).
+        If > 0, mixes ctfp and ctfq based on angle threshold:
+        - ctfp: uses ctfp at angles >= discontinuity_angle,
+          ctfq at angles < discontinuity_angle
+        - ctfq: uses ctfq at angles >= discontinuity_angle,
+          ctfp at angles < discontinuity_angle
+        If 0, behavior is unchanged (all ctfp and all ctfq).
+        Note: Since ctfp and ctfq are complex conjugates, this mixing
+        is equivalent to rotating the coordinate system.
     beam_tilt_mrad : torch.Tensor | None
         Beam tilt in milliradians. [bx, by] in mrad
     even_zernike_coeffs : dict | None
@@ -67,6 +86,10 @@ def calculate_ctfp_and_ctfq_2d(
     ctfq : torch.Tensor
         The Q component of the CTF for the given parameters (complex tensor).
     """
+    # Enforce rfft=True for Ewald sphere correction
+    if not rfft:
+        raise ValueError("rfft must be True for Ewald sphere correction")
+
     (
         defocus,
         voltage,
@@ -120,17 +143,326 @@ def calculate_ctfp_and_ctfq_2d(
         -torch.cos(total_phase_shift),
     )
 
-    if odd_zernike_coeffs is None:
-        return ctfp, ctfq
+    # Apply odd zernike coefficients if provided
+    if odd_zernike_coeffs is not None or beam_tilt_mrad is not None:
+        antisymmetric_phase_shift = apply_odd_zernikes(
+            odd_zernikes=odd_zernike_coeffs,
+            rho=rho,
+            theta=theta,
+            voltage_kv=voltage,
+            spherical_aberration_mm=spherical_aberration,
+            beam_tilt_mrad=beam_tilt_mrad,
+        )
+        ctfp = ctfp * torch.exp(1j * antisymmetric_phase_shift)
+        ctfq = ctfq * torch.exp(1j * antisymmetric_phase_shift)
 
-    antisymmetric_phase_shift = apply_odd_zernikes(
-        odd_zernikes=odd_zernike_coeffs,
-        rho=rho,
-        theta=theta,
-        voltage_kv=voltage,
-        spherical_aberration_mm=spherical_aberration,
-        beam_tilt_mrad=beam_tilt_mrad,
+    # Apply discontinuity angle mixing if specified
+    if discontinuity_angle > 0.0:
+        # Get device from ctfp
+        device = ctfp.device
+
+        # Get angles for each pixel
+        angles = _get_fourier_angle(
+            image_shape=image_shape,
+            rfft=rfft,
+            fftshift=fftshift,
+            device=device,
+        )
+
+        # Create mask for angles >= discontinuity_angle
+        angle_mask = angles >= discontinuity_angle
+
+        # Mix ctfp and ctfq based on angle threshold
+        # ctfp: angles >= discontinuity_angle -> ctfp,
+        #       angles < discontinuity_angle -> ctfq
+        # ctfq: angles >= discontinuity_angle -> ctfq,
+        #       angles < discontinuity_angle -> ctfp
+        # Note: Since ctfp and ctfq are complex conjugates,
+        # this mixing is equivalent to rotating the coordinate system.
+        ctfp_mixed = torch.where(angle_mask, ctfp, ctfq)
+        ctfq_mixed = torch.where(angle_mask, ctfq, ctfp)
+
+        return ctfp_mixed, ctfq_mixed
+
+    # Enforce Friedel symmetry when discontinuity_angle=0
+    if discontinuity_angle == 0.0:
+        ctfp = _enforce_symmetry(ctfp, image_shape=image_shape, fftshift=fftshift)
+        ctfq = _enforce_symmetry(ctfq, image_shape=image_shape, fftshift=fftshift)
+
+    return ctfp, ctfq
+
+
+def _enforce_symmetry(
+    rfft_tensor: torch.Tensor,
+    image_shape: tuple[int, int],
+    fftshift: bool = False,
+) -> torch.Tensor:
+    """Enforce Friedel symmetry along the y-axis at x=0 in rfft.
+
+    For pixels at x=0, +y must equal the complex conjugate of -y.
+    This ensures F(0, y) = F*(0, -y) for all y.
+
+    Parameters
+    ----------
+    rfft_tensor : torch.Tensor
+        A complex tensor in rfft format (shape: (..., h, w//2+1)).
+    image_shape : tuple[int, int]
+        Shape of 2D images (height, width).
+    fftshift : bool
+        Whether fftshift is applied to the frequency grid.
+
+    Returns
+    -------
+    rfft_tensor : torch.Tensor
+        The tensor with enforced symmetry.
+    """
+    device = rfft_tensor.device
+    eps = 1e-10
+
+    # Get frequency grid
+    fft_freq_grid = fftfreq_grid(
+        image_shape=image_shape,
+        rfft=True,
+        fftshift=fftshift,
+        norm=False,
+        device=device,
     )
-    return ctfp * torch.exp(1j * antisymmetric_phase_shift), ctfq * torch.exp(
-        1j * antisymmetric_phase_shift
+
+    # Get x and y coordinates
+    x_coords = fft_freq_grid[..., 0]  # (h, w//2+1) - x frequencies
+    y_coords = fft_freq_grid[..., 1]  # (h, w//2+1) - y frequencies
+
+    # Find points at x=0
+    x_is_zero = torch.abs(x_coords) < eps
+
+    # Find Friedel redundant points: x=0 and y<0
+    y_negative = y_coords < -eps
+    friedel_redundant = x_is_zero & y_negative
+
+    rfft_tensor = rfft_tensor.clone()
+
+    # For each point at x=0 with y<0, set it to conjugate of corresponding y>0 point
+    # Get indices of redundant points
+    redundant_indices = torch.where(friedel_redundant)
+    h_neg = redundant_indices[0]
+    w_neg = redundant_indices[1]
+
+    # Only process if there are redundant points
+    if len(h_neg) > 0:
+        # For each negative y point, find its positive y counterpart
+        y_neg_vals = y_coords[h_neg, w_neg]
+        y_pos_vals = -y_neg_vals
+
+        # Find matching positive y points at x=0
+        # Use broadcasting to find all matches
+        y_diff = torch.abs(y_coords[None, ...] - y_pos_vals[:, None, None])
+        # Only consider points at x=0
+        y_diff = torch.where(x_is_zero[None, ...], y_diff, torch.inf)
+        # Find minimum difference for each negative y
+        min_diff, min_indices_flat = torch.min(y_diff.view(len(y_neg_vals), -1), dim=1)
+        # Convert flat index back to (h, w) indices
+        _, w_shape = y_coords.shape
+        h_pos = min_indices_flat // w_shape
+        w_pos = min_indices_flat % w_shape
+
+        # Only process where we found a valid match
+        valid_match = min_diff < eps
+        if valid_match.any():
+            h_neg_valid = h_neg[valid_match]
+            w_neg_valid = w_neg[valid_match]
+            h_pos_valid = h_pos[valid_match]
+            w_pos_valid = w_pos[valid_match]
+
+            # Set negative y values to conjugate of positive y values
+            # F(0, y_neg) = F*(0, y_pos)
+            rfft_tensor[..., h_neg_valid, w_neg_valid] = torch.conj(
+                rfft_tensor[..., h_pos_valid, w_pos_valid]
+            )
+
+    return rfft_tensor
+
+
+def _get_fourier_angle(
+    image_shape: tuple[int, int],
+    rfft: bool = True,
+    fftshift: bool = False,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Get the Fourier angle for each pixel in the rfft (0-180 degrees).
+
+    Parameters
+    ----------
+    image_shape : tuple[int, int]
+        Shape of 2D images (height, width).
+    rfft : bool
+        Whether to use rfft format (default: True).
+    fftshift : bool
+        Whether fftshift is applied (default: False).
+    device : torch.device | None
+        Device to create tensors on. If None, uses CPU.
+
+    Returns
+    -------
+    angle_degrees : torch.Tensor
+        Angle in degrees (0-180) for each pixel in the rfft.
+        Shape matches the rfft output: (h, w//2+1) if rfft=True.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    # Get frequency grid
+    fft_freq_grid = fftfreq_grid(
+        image_shape=image_shape,
+        rfft=rfft,
+        fftshift=fftshift,
+        norm=False,
+        device=device,
     )
+
+    # Calculate angle using atan2 (returns -π to π)
+    kx = fft_freq_grid[..., 0]
+    ky = fft_freq_grid[..., 1]
+    theta = torch.atan2(ky, kx)
+
+    # Convert to 0-180 degrees range
+    # For rfft, we want angles from 0 to π (0-180 degrees)
+    # Take absolute value to get 0 to π, then convert to degrees
+    angle_radians = torch.abs(theta)
+    angle_degrees = torch.rad2deg(angle_radians)
+
+    return angle_degrees
+
+
+def get_ctf_weighting(
+    defocus_um: float | torch.Tensor,
+    voltage_kv: float | torch.Tensor,
+    spherical_aberration_mm: float | torch.Tensor,
+    pixel_size: float | torch.Tensor,
+    particle_diameter_angstrom: float | torch.Tensor,
+    image_shape: tuple[int, int],
+    rfft: bool = True,
+    fftshift: bool = False,
+) -> torch.Tensor:
+    """Calculate CTF weighting factor W for Ewald sphere correction.
+
+    Implements equation (6) and (7) from the reference:
+    W = 1 + A(2|sin(χ)| - 1)
+
+    where A is the degree of overlap between pseudo-Friedel-related sidebands.
+
+    Parameters
+    ----------
+    defocus_um : float | torch.Tensor
+        Defocus in micrometers, positive is underfocused.
+    voltage_kv : float | torch.Tensor
+        Acceleration voltage in kilovolts (kV).
+    spherical_aberration_mm : float | torch.Tensor
+        Spherical aberration in millimeters (mm).
+    pixel_size : float | torch.Tensor
+        Pixel size in Angströms per pixel (Å px⁻¹).
+    particle_diameter_angstrom : float | torch.Tensor
+        Particle diameter in Angstroms.
+    image_shape : tuple[int, int]
+        Shape of 2D images (height, width).
+    rfft : bool
+        Whether to use rfft format (default: True).
+    fftshift : bool
+        Whether fftshift is applied (default: False).
+
+    Returns
+    -------
+    W : torch.Tensor
+        CTF weighting factor with same shape as rfft output: (h, w//2+1) if rfft=True.
+    """
+    # Determine device
+    if isinstance(defocus_um, torch.Tensor):
+        device = defocus_um.device
+    else:
+        device = torch.device("cpu")
+
+    # Convert to tensors
+    defocus_um = torch.as_tensor(defocus_um, dtype=torch.float, device=device)
+    voltage_kv = torch.as_tensor(voltage_kv, dtype=torch.float, device=device)
+    spherical_aberration_mm = torch.as_tensor(
+        spherical_aberration_mm, dtype=torch.float, device=device
+    )
+    pixel_size = torch.as_tensor(pixel_size, dtype=torch.float, device=device)
+    particle_diameter_angstrom = torch.as_tensor(
+        particle_diameter_angstrom, dtype=torch.float, device=device
+    )
+
+    # Get frequency grid in Angstroms^-1
+    fft_freq_grid = fftfreq_grid(
+        image_shape=image_shape,
+        rfft=rfft,
+        fftshift=fftshift,
+        norm=False,
+        device=device,
+    )
+    # Convert from cycles/pixel to cycles/Angstrom
+    fft_freq_grid = fft_freq_grid / einops.rearrange(pixel_size, "... -> ... 1 1 1")
+
+    # Calculate frequency magnitude and squared for phase aberration
+    fft_freq_grid_squared = einops.reduce(
+        fft_freq_grid**2, "... f->...", reduction="sum"
+    )
+
+    # Calculate resolution d = 1/|k| in Angstroms
+    # Add small epsilon to avoid division by zero
+    eps = 1e-12
+    freq_magnitude = torch.sqrt(fft_freq_grid_squared + eps)
+    resolution_d = 1.0 / freq_magnitude  # Angstroms
+
+    # Calculate phase aberration chi
+    chi = calculate_defocus_phase_aberration(
+        defocus_um=defocus_um,
+        voltage_kv=voltage_kv,
+        spherical_aberration_mm=spherical_aberration_mm,
+        fftfreq_grid_angstrom_squared=fft_freq_grid_squared,
+    )
+
+    # Calculate wavelength lambda in Angstroms
+    voltage = voltage_kv * 1e3  # kV -> V
+    _lambda = (
+        calculate_relativistic_electron_wavelength(voltage) * 1e10
+    )  # meters -> Angstroms
+
+    # Convert defocus from micrometers to Angstroms
+    deltaF = defocus_um * 1e4  # micrometers -> Angstroms
+
+    # Calculate A based on equation (7)
+    # A = (2/π) [arccos(2ΔFλ / (dD)) - (2ΔFλ / (dD)) sin(arccos(2ΔFλ / (dD)))]
+    # for 0 < ΔF < Dd/(2λ)
+    # A = 0 for ΔF > Dd/(2λ)
+
+    # Calculate threshold: Dd/(2λ)
+    threshold = (particle_diameter_angstrom * resolution_d) / (2 * _lambda)
+
+    # Calculate argument: 2ΔFλ / (dD)
+    # Reshape deltaF to broadcast with resolution_d
+    deltaF = einops.rearrange(deltaF, "... -> ... 1 1")
+    _lambda = einops.rearrange(_lambda, "... -> ... 1 1")
+    particle_diameter_angstrom = einops.rearrange(
+        particle_diameter_angstrom, "... -> ... 1 1"
+    )
+
+    arg = (2 * deltaF * _lambda) / (resolution_d * particle_diameter_angstrom)
+
+    # Calculate A piecewise
+    # For 0 < ΔF < Dd/(2λ): use formula
+    # For ΔF > Dd/(2λ): A = 0
+    overlap_condition = (deltaF > 0) & (deltaF < threshold)
+
+    # Calculate A for overlapping case
+    arccos_arg = torch.clamp(arg, -1.0, 1.0)  # Ensure valid range for arccos
+    arccos_val = torch.arccos(arccos_arg)
+    A_overlap = (2 / torch.pi) * (arccos_val - arg * torch.sin(arccos_val))
+
+    # Set A = 0 for no overlap case
+    A = torch.where(overlap_condition, A_overlap, torch.tensor(0.0, device=device))
+
+    # Calculate W = 1 + A(2|sin(χ)| - 1)
+    sin_chi_abs = torch.abs(torch.sin(chi))
+    W = 1.0 + A * (2 * sin_chi_abs - 1.0)
+
+    return W

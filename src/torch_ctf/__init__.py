@@ -12,7 +12,7 @@ from torch_ctf.ctf_aberrations import (
     calculate_relativistic_electron_wavelength,
     resolve_odd_zernikes,
 )
-from torch_ctf.ctf_ewald import calculate_ctfp_and_ctfq_2d
+from torch_ctf.ctf_ewald import calculate_ctfp_and_ctfq_2d, get_ctf_weighting
 from torch_ctf.ctf_lpp import (
     calc_LPP_ctf_2D,
     calc_LPP_phase,
@@ -52,6 +52,7 @@ __all__ = [
     "calculate_relativistic_electron_wavelength",
     "calculate_relativistic_gamma",
     "calculate_total_phase_shift",
+    "get_ctf_weighting",
     "get_eta",
     "get_eta0_from_peak_phase_deg",
     "initialize_laser_params",

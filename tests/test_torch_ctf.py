@@ -1328,8 +1328,8 @@ def test_beam_tilt_to_zernike_coeffs_broadcasting():
 def test_zernike_coeffs_to_beam_tilt():
     """Test Zernike coefficients to beam tilt conversion."""
     zernike_coeffs = {
-        "Z31c": torch.tensor(6.575432),
-        "Z31s": torch.tensor(13.150864),
+        "Z31c": torch.tensor(-861694.625),
+        "Z31s": torch.tensor(-1723389.25),
     }
     voltage_kv = torch.tensor(300.0)
     spherical_aberration_mm = torch.tensor(2.7)
@@ -1351,8 +1351,8 @@ def test_zernike_coeffs_to_beam_tilt():
 def test_zernike_coeffs_to_beam_tilt_broadcasting():
     """Test zernike_coeffs_to_beam_tilt with different tensor shapes."""
     zernike_coeffs = {
-        "Z31c": torch.tensor([6.575432, 3.287716]),
-        "Z31s": torch.tensor([13.150864, 9.863148]),
+        "Z31c": torch.tensor([-861694.625, -4308473.0]),
+        "Z31s": torch.tensor([-1723389.25, -12925419.0]),
     }
     voltage_kv = torch.tensor(300.0)
     spherical_aberration_mm = torch.tensor(2.7)
@@ -1370,7 +1370,7 @@ def test_zernike_coeffs_to_beam_tilt_broadcasting():
 
 def test_zernike_coeffs_to_beam_tilt_missing_keys():
     """Test zernike_coeffs_to_beam_tilt with missing keys raises error."""
-    zernike_coeffs = {"Z31c": torch.tensor(6.575432)}
+    zernike_coeffs = {"Z31c": torch.tensor(-861694.625)}
     voltage_kv = torch.tensor(300.0)
     spherical_aberration_mm = torch.tensor(2.7)
 

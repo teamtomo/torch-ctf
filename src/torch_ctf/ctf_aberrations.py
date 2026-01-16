@@ -110,7 +110,8 @@ def beam_tilt_to_zernike_coeffs(
     Cs = spherical_aberration_mm * 1e7  # mm → Å
     lam = calculate_relativistic_electron_wavelength(voltage) * 1e10  # Å
 
-    prefactor = 2 * C.pi * Cs * lam**2
+    prefactor = -2 * C.pi * Cs / lam
+
 
     return {
         "Z31c": prefactor * beam_tilt_rad[..., 0],
@@ -150,8 +151,7 @@ def zernike_coeffs_to_beam_tilt(
     Cs = spherical_aberration_mm * 1e7  # mm → Å
     lam = calculate_relativistic_electron_wavelength(voltage) * 1e10  # Å
 
-    prefactor = 2 * C.pi * Cs * lam**2
-
+    prefactor = -2 * C.pi * Cs / lam
     # Convert Zernike coefficients to beam tilt in radians
     beam_tilt_rad = torch.stack(
         [
